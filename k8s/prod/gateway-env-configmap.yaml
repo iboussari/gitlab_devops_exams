@@ -1,0 +1,10 @@
+apiVersion: v1
+data:
+  ORDERS_SERVICE_URL: http://orders:8000
+  USERS_SERVICE_URL: http://users:8000
+kind: ConfigMap
+metadata:
+  namespace: prod
+  labels:
+    io.kompose.service: gateway-gateway-env
+  name: gateway-env

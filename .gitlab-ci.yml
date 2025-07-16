@@ -1,0 +1,119 @@
+stages:
+  - build
+  - push
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_IMAGE_GATEWAY: iboussari/gateway
+  DOCKER_IMAGE_USERS: iboussari/users
+  DOCKER_IMAGE_ORDERS: iboussari/orders
+
+#Build des images
+build_gateway:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t $DOCKER_IMAGE_GATEWAY ./gateway
+  only:
+    - branches
+
+build_users:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t $DOCKER_IMAGE_USERS ./users
+  only:
+    - branches
+
+build_orders:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t $DOCKER_IMAGE_ORDERS ./orders
+  only:
+    - branches
+
+#Push vers DockerHub
+push_gateway:
+  stage: push
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin
+    - docker push $DOCKER_IMAGE_GATEWAY
+  only:
+    - branches
+
+push_users:
+  stage: push
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin
+    - docker push $DOCKER_IMAGE_USERS
+  only:
+    - branches
+
+push_orders:
+  stage: push
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin
+    - docker push $DOCKER_IMAGE_ORDERS
+  only:
+    - branches
+
+#Déploiement automatique sur dev, qa, staging
+deploy_dev:
+  stage: deploy
+  image: alpine/helm:3.12.0
+  script:
+    - helm upgrade --install gateway ./charts/gateway --namespace dev
+    - helm upgrade --install users ./charts/users --namespace dev
+    - helm upgrade --install orders ./charts/orders --namespace dev
+  only:
+    - dev
+
+deploy_qa:
+  stage: deploy
+  image: alpine/helm:3.12.0
+  script:
+    - helm upgrade --install gateway ./charts/gateway --namespace qa
+    - helm upgrade --install users ./charts/users --namespace qa
+    - helm upgrade --install orders ./charts/orders --namespace qa
+  only:
+    - qa
+
+deploy_staging:
+  stage: deploy
+  image: alpine/helm:3.12.0
+  script:
+    - helm upgrade --install gateway ./charts/gateway --namespace staging
+    - helm upgrade --install users ./charts/users --namespace staging
+    - helm upgrade --install orders ./charts/orders --namespace staging
+  only:
+    - staging
+
+#Déploiement manuel en production
+deploy_prod:
+  stage: deploy
+  image: alpine/helm:3.12.0
+  script:
+    - helm upgrade --install gateway ./charts/gateway --namespace prod
+    - helm upgrade --install users ./charts/users --namespace prod
+    - helm upgrade --install orders ./charts/orders --namespace prod
+  only:
+    - main
+  when: manual

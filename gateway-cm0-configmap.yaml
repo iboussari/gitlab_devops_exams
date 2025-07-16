@@ -1,0 +1,469 @@
+apiVersion: v1
+data:
+  .env: |
+    USERS_SERVICE_URL=http://users:8000
+    ORDERS_SERVICE_URL=http://orders:8000
+  __init__.py: ""
+  Dockerfile: |
+    FROM python:3.7.7
+
+    WORKDIR /app
+
+    ENV PYTHONDONTWRITEBYTECODE 1
+    ENV PYTHONBUFFERED 1
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+  auth.py: |
+    import jwt
+
+    from datetime import datetime, timedelta
+
+    from conf import settings
+    from exceptions import AuthTokenMissing, AuthTokenExpired, AuthTokenCorrupted
+
+
+    SECRET_KEY = 'e0e5f53b239df3dc39517c34ae0a1c09d1f5d181dfac1578d379a4a5ee3e0ef5'
+    ALGORITHM = 'HS256'
+
+
+    def generate_access_token(
+            data: dict,
+            expires_delta: timedelta = timedelta(
+                minutes=settings.ACCESS_TOKEN_DEFAULT_EXPIRE_MINUTES
+            )
+    ):
+
+        expire = datetime.utcnow() + expires_delta
+        token_data = {
+            'id': data['id'],
+            'user_type': data['user_type'],
+            'exp': expire,
+        }
+
+        encoded_jwt = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
+        return encoded_jwt
+
+
+    def decode_access_token(authorization: str = None):
+        if not authorization:
+            raise AuthTokenMissing('Auth token is missing in headers.')
+
+        token = authorization.replace('Bearer ', '')
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=ALGORITHM)
+            return payload
+        except jwt.exceptions.ExpiredSignatureError:
+            raise AuthTokenExpired('Auth token is expired.')
+        except jwt.exceptions.DecodeError:
+            raise AuthTokenCorrupted('Auth token is corrupted.')
+
+
+    def generate_request_header(token_payload):
+        return {'request-user-id': str(token_payload['id'])}
+
+
+    def is_admin_user(token_payload):
+        return token_payload['user_type'] == 'admin'
+
+
+    def is_default_user(token_payload):
+        return token_payload['user_type'] in ['default', 'admin']
+  conf.py: |
+    import os
+
+    from pydantic import BaseSettings
+
+
+    class Settings(BaseSettings):
+        ACCESS_TOKEN_DEFAULT_EXPIRE_MINUTES: int = 360
+        USERS_SERVICE_URL: str = os.environ.get('USERS_SERVICE_URL')
+        ORDERS_SERVICE_URL: str = os.environ.get('ORDERS_SERVICE_URL')
+        GATEWAY_TIMEOUT: int = 59
+
+
+    settings = Settings()
+  core.py: |
+    import aiohttp
+    import functools
+
+
+    from importlib import import_module
+    from fastapi import Request, Response, HTTPException, status
+    from typing import List
+
+    from exceptions import (AuthTokenMissing, AuthTokenExpired, AuthTokenCorrupted)
+    from network import make_request
+
+
+    def route(
+            request_method, path: str, status_code: int,
+            payload_key: str, service_url: str,
+            authentication_required: bool = False,
+            post_processing_func: str = None,
+            authentication_token_decoder: str = 'auth.decode_access_token',
+            service_authorization_checker: str = 'auth.is_admin_user',
+            service_header_generator: str = 'auth.generate_request_header',
+            response_model: str = None,
+            response_list: bool = False
+    ):
+        """
+        it is an advanced wrapper for FastAPI router, purpose is to make FastAPI
+        acts as a gateway API in front of anything
+
+        Args:
+            request_method: is a callable like (app.get, app.post and so on.)
+            path: is the path to bind (like app.post('/api/users/'))
+            status_code: expected HTTP(status.HTTP_200_OK) status code
+            payload_key: used to easily fetch payload data in request body
+            authentication_required: is bool to give to user an auth priviliges
+            post_processing_func: does extra things once in-network service returns
+            authentication_token_decoder: decodes JWT token as a proper payload
+            service_authorization_checker: does simple front authorization checks
+            service_header_generator: generates headers for inner services from jwt token payload # noqa
+            response_model: shows return type and details on api docs
+            response_list: decides whether response structure is list or not
+
+        Returns:
+            wrapped endpoint result as is
+
+        """
+
+        # request_method: app.post || app.get or so on
+        # app_any: app.post('/api/login', status_code=200, response_model=int)
+        if response_model:
+            response_model = import_function(response_model)
+            if response_list:
+                response_model = List[response_model]
+
+        app_any = request_method(
+            path, status_code=status_code,
+            response_model=response_model
+        )
+
+        def wrapper(f):
+            @app_any
+            @functools.wraps(f)
+            async def inner(request: Request, response: Response, **kwargs):
+                service_headers = {}
+
+                if authentication_required:
+                    # authentication
+                    authorization = request.headers.get('authorization')
+                    token_decoder = import_function(authentication_token_decoder)
+                    exc = None
+                    try:
+                        token_payload = token_decoder(authorization)
+                    except (AuthTokenMissing,
+                            AuthTokenExpired,
+                            AuthTokenCorrupted) as e:
+                        exc = str(e)
+                    except Exception as e:
+                        # in case a new decoder is used by dependency injection and
+                        # there might be an unexpected error
+                        exc = str(e)
+                    finally:
+                        if exc:
+                            raise HTTPException(
+                                status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail=exc,
+                                headers={'WWW-Authenticate': 'Bearer'},
+                            )
+
+                    # authorization
+                    if service_authorization_checker:
+                        authorization_checker = import_function(
+                            service_authorization_checker
+                        )
+                        is_user_eligible = authorization_checker(token_payload)
+                        if not is_user_eligible:
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail='You are not allowed to access this scope.',
+                                headers={'WWW-Authenticate': 'Bearer'},
+                            )
+
+                    # service headers
+                    if service_header_generator:
+                        header_generator = import_function(
+                            service_header_generator
+                        )
+                        service_headers = header_generator(token_payload)
+
+                scope = request.scope
+
+                method = scope['method'].lower()
+                path = scope['path']
+
+                payload_obj = kwargs.get(payload_key)
+                payload = payload_obj.dict() if payload_obj else {}
+
+                url = f'{service_url}{path}'
+
+                try:
+                    resp_data, status_code_from_service = await make_request(
+                        url=url,
+                        method=method,
+                        data=payload,
+                        headers=service_headers,
+                    )
+                except aiohttp.client_exceptions.ClientConnectorError:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail='Service is unavailable.',
+                        headers={'WWW-Authenticate': 'Bearer'},
+                    )
+                except aiohttp.client_exceptions.ContentTypeError:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail='Service error.',
+                        headers={'WWW-Authenticate': 'Bearer'},
+                    )
+
+                response.status_code = status_code_from_service
+
+                if all([
+                    status_code_from_service == status_code,
+                    post_processing_func
+                ]):
+                    post_processing_f = import_function(post_processing_func)
+                    resp_data = post_processing_f(resp_data)
+
+                return resp_data
+
+        return wrapper
+
+
+    def import_function(method_path):
+        module, method = method_path.rsplit('.', 1)
+        mod = import_module(module)
+        return getattr(mod, method, lambda *args, **kwargs: None)
+  exceptions.py: |
+    class AuthTokenMissing(Exception):
+        pass
+
+
+    class AuthTokenExpired(Exception):
+        pass
+
+
+    class AuthTokenCorrupted(Exception):
+        pass
+  main.py: |
+    from fastapi import FastAPI, status, Request, Response
+
+    from conf import settings
+    from core import route
+
+    from datastructures.users import (UsernamePasswordForm,
+                                      UserForm,
+                                      UserUpdateForm)
+    from datastructures.orders import OrderForm
+
+    app = FastAPI()
+
+
+    @route(
+        request_method=app.post,
+        path='/api/login',
+        status_code=status.HTTP_201_CREATED,
+        payload_key='username_password',
+        service_url=settings.USERS_SERVICE_URL,
+        authentication_required=False,
+        post_processing_func='post_processing.access_token_generate_handler',
+        response_model='datastructures.users.LoginResponse'
+    )
+    async def login(username_password: UsernamePasswordForm,
+                    request: Request, response: Response):
+        pass
+
+
+    @route(
+        request_method=app.post,
+        path='/api/users',
+        status_code=status.HTTP_201_CREATED,
+        payload_key='user',
+        service_url=settings.USERS_SERVICE_URL,
+        authentication_required=True,
+        post_processing_func=None,
+        authentication_token_decoder='auth.decode_access_token',
+        service_authorization_checker='auth.is_admin_user',
+        service_header_generator='auth.generate_request_header',
+        response_model='datastructures.users.UserResponse',
+    )
+    async def create_user(user: UserForm, request: Request, response: Response):
+        pass
+
+
+    @route(
+        request_method=app.get,
+        path='/api/users',
+        status_code=status.HTTP_200_OK,
+        payload_key=None,
+        service_url=settings.USERS_SERVICE_URL,
+        authentication_required=True,
+        post_processing_func=None,
+        authentication_token_decoder='auth.decode_access_token',
+        service_authorization_checker='auth.is_admin_user',
+        service_header_generator='auth.generate_request_header',
+        response_model='datastructures.users.UserResponse',
+        response_list=True
+    )
+    async def get_users(request: Request, response: Response):
+        pass
+
+
+    @route(
+        request_method=app.get,
+        path='/api/users/{user_id}',
+        status_code=status.HTTP_200_OK,
+        payload_key=None,
+        service_url=settings.USERS_SERVICE_URL,
+        authentication_required=True,
+        post_processing_func=None,
+        authentication_token_decoder='auth.decode_access_token',
+        service_authorization_checker='auth.is_admin_user',
+        service_header_generator='auth.generate_request_header',
+        response_model='datastructures.users.UserResponse',
+    )
+    async def get_user(user_id: int, request: Request, response: Response):
+        pass
+
+
+    @route(
+        request_method=app.delete,
+        path='/api/users/{user_id}',
+        status_code=status.HTTP_204_NO_CONTENT,
+        payload_key=None,
+        service_url=settings.USERS_SERVICE_URL,
+        authentication_required=True,
+        post_processing_func=None,
+        authentication_token_decoder='auth.decode_access_token',
+        service_authorization_checker='auth.is_admin_user',
+        service_header_generator='auth.generate_request_header',
+    )
+    async def delete_user(user_id: int, request: Request, response: Response):
+        pass
+
+
+    @route(
+        request_method=app.put,
+        path='/api/users/{user_id}',
+        status_code=status.HTTP_200_OK,
+        payload_key='user',
+        service_url=settings.USERS_SERVICE_URL,
+        authentication_required=True,
+        post_processing_func=None,
+        authentication_token_decoder='auth.decode_access_token',
+        service_authorization_checker='auth.is_admin_user',
+        service_header_generator='auth.generate_request_header',
+        response_model='datastructures.users.UserResponse',
+    )
+    async def update_user(user_id: int, user: UserUpdateForm,
+                          request: Request, response: Response):
+        pass
+
+
+    @route(
+        request_method=app.get,
+        path='/api/orders',
+        status_code=status.HTTP_200_OK,
+        payload_key=None,
+        service_url=settings.ORDERS_SERVICE_URL,
+        authentication_required=True,
+        post_processing_func=None,
+        authentication_token_decoder='auth.decode_access_token',
+        service_authorization_checker='auth.is_default_user',
+        service_header_generator='auth.generate_request_header',
+        response_model='datastructures.orders.OrderResponse',
+        response_list=True,
+    )
+    async def get_orders(request: Request, response: Response):
+        pass
+
+
+    @route(
+        request_method=app.post,
+        path='/api/orders',
+        status_code=status.HTTP_200_OK,
+        payload_key='order',
+        service_url=settings.ORDERS_SERVICE_URL,
+        authentication_required=True,
+        post_processing_func=None,
+        authentication_token_decoder='auth.decode_access_token',
+        service_authorization_checker='auth.is_default_user',
+        service_header_generator='auth.generate_request_header',
+        response_model='datastructures.orders.OrderResponse',
+    )
+    async def create_order(order: OrderForm, request: Request, response: Response):
+        pass
+  network.py: |
+    import aiohttp
+    import async_timeout
+
+    from conf import settings
+
+
+    async def make_request(
+        url: str,
+        method: str,
+        data: dict = None,
+        headers: dict = None
+    ):
+        """
+        Args:
+            url: is the url for one of the in-network services
+            method: is the lower version of one of the HTTP methods: GET, POST, PUT, DELETE # noqa
+            data: is the payload
+            headers: is the header to put additional headers into request
+
+        Returns:
+            service result coming / non-blocking http request (coroutine)
+            e.g:   {
+                        "id": 2,
+                        "username": "baranbartu",
+                        "email": "baran@baran.com",
+                        "full_name": "Baran Bartu Demirci",
+                        "user_type": "baran",
+                        "hashed_password": "***",
+                        "created_by": 1
+                    }
+        """
+        if not data:
+            data = {}
+
+        with async_timeout.timeout(settings.GATEWAY_TIMEOUT):
+            async with aiohttp.ClientSession() as session:
+                request = getattr(session, method)
+                async with request(url, json=data, headers=headers) as response:
+                    data = await response.json()
+                    return (data, response.status)
+  post_processing.py: |
+    from auth import generate_access_token
+
+
+    def access_token_generate_handler(data):
+        access_token = generate_access_token(data)
+        return {
+            'access_token': access_token, 'token_type': 'bearer'
+        }
+  requirements.txt: |
+    fastapi==0.58.0
+    uvicorn==0.11.5
+    PyJWT==1.7.1
+
+    # async http requests & fast dns resolving
+    aiohttp==3.6.2
+    aiodns==2.0.0
+
+    # for test purposes
+    flake8==3.8.3
+    ipdb==0.13.2
+    ipython==7.15.0
+kind: ConfigMap
+metadata:
+  labels:
+    io.kompose.service: gateway
+  name: gateway-cm0

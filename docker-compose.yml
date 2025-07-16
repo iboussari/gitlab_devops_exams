@@ -25,6 +25,8 @@ services:
             dockerfile: Dockerfile
         env_file:
             - ./users/.env
+        ports:
+          - 8002:8000
         volumes:
           - ./users:/app
 
@@ -36,5 +38,7 @@ services:
             dockerfile: Dockerfile
         env_file:
             - ./orders/.env
+        ports:
+          - 8003:8000
         volumes:
           - ./orders:/app
